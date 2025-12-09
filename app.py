@@ -8,10 +8,33 @@ from core.modelo_avancado import inicializar_modelo_ia, modelo_ia
 from core.clima import is_frio
 from core.cardapio import CARDAPIO
 import os
+import pandas as pd  # <-- Import adicionado explicitamente
 
 # Garante que a pasta 'models' exista
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'core', 'models')
 os.makedirs(MODELS_DIR, exist_ok=True)
+
+# --- NOVA FUNÇÃO MOVIDA PARA O ESCOPO GLOBAL ---
+def encontrar_clientes_similares(cliente_id_alvo: int, df: pd.DataFrame):
+    try:
+        perfil_clientes = df.groupby('cliente_id')['ingredientes'].apply(lambda x: ' '.join(x)).reset_index()
+        perfil_clientes['ingredientes'] = perfil_clientes['ingredientes'].str.lower()
+
+        if cliente_id_alvo not in perfil_clientes['cliente_id'].values:
+            return pd.DataFrame()
+
+        vectorizer = TfidfVectorizer()
+        tfidf_matrix = vectorizer.fit_transform(perfil_clientes['ingredientes'])
+
+        cliente_idx = perfil_clientes[perfil_clientes['cliente_id'] == cliente_id_alvo].index[0]
+        similarities = cosine_similarity(tfidf_matrix[cliente_idx], tfidf_matrix).flatten()
+
+        perfil_clientes['similaridade'] = similarities
+        similares = perfil_clientes[perfil_clientes['cliente_id'] != cliente_id_alvo].sort_values(by='similaridade', ascending=False)
+        return similares.head(3)
+    except:
+        return pd.DataFrame()
+# ---
 
 def create_app():
     app = Flask(__name__)
@@ -43,7 +66,6 @@ def create_app():
                 "motivo": motivo
             })
         else:
-            # Fallback para o modelo antigo
             print(f"Falha no modelo avançado: {motivo}. Usando modelo antigo.")
             return recomendar_fallback(cliente_id)
 
@@ -70,7 +92,7 @@ def create_app():
             hora_atual = agora.hour
 
             if cliente_id and cliente_id in df['cliente_id'].values:
-                clientes_similares = encontrar_clientes_similares(cliente_id, df)
+                clientes_similares = encontrar_clientes_similares(cliente_id, df) # <-- Agora chama a função global
                 df_contexto = df[
                     (df['dia_semana'] == dia_atual) &
                     (df['hora'] >= max(0, hora_atual - 2)) &
@@ -132,25 +154,36 @@ def create_app():
         except Exception as e:
             return jsonify({"erro": "Falha na recomendação do fallback", "detalhe": str(e)}), 500
 
-    def encontrar_clientes_similares(cliente_id_alvo: int, df: pd.DataFrame):
+    # Função auxiliar para obter conexão (copiada do pizza_recommender para evitar importação circular)
+    def get_db_connection():
+        from contextlib import contextmanager
+        import sqlite3
+        DB_PATH = os.path.join(os.path.dirname(__file__), 'data', 'pizzaria.db')
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
         try:
-            perfil_clientes = df.groupby('cliente_id')['ingredientes'].apply(lambda x: ' '.join(x)).reset_index()
-            perfil_clientes['ingredientes'] = perfil_clientes['ingredientes'].str.lower()
+            yield conn
+        finally:
+            conn.close()
 
-            if cliente_id_alvo not in perfil_clientes['cliente_id'].values:
-                return pd.DataFrame()
-
-            vectorizer = TfidfVectorizer()
-            tfidf_matrix = vectorizer.fit_transform(perfil_clientes['ingredientes'])
-
-            cliente_idx = perfil_clientes[perfil_clientes['cliente_id'] == cliente_id_alvo].index[0]
-            similarities = cosine_similarity(tfidf_matrix[cliente_idx], tfidf_matrix).flatten()
-
-            perfil_clientes['similaridade'] = similarities
-            similares = perfil_clientes[perfil_clientes['cliente_id'] != cliente_id_alvo].sort_values(by='similaridade', ascending=False)
-            return similares.head(3)
+    def is_vegetariano(cliente_id: int) -> bool:
+        from collections import Counter
+        carnes = {'pepperoni', 'calabresa', 'frango', 'presunto', 'bacon', 'carne', 'salsicha'}
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.execute('SELECT ingredientes FROM pedidos WHERE cliente_id = ?', (cliente_id,))
+                historico = cursor.fetchall()
+            for row in historico:
+                ingredientes = set(ing.strip().lower() for ing in row['ingredientes'].split(','))
+                if ingredientes & carnes:
+                    return False
+            return True
         except:
-            return pd.DataFrame()
+            return False
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    from collections import Counter
 
     app.register_blueprint(pizza_bp, url_prefix='/api')
     app.register_blueprint(bp_pedidos, url_prefix='/api')
